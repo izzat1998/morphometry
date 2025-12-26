@@ -46,6 +46,27 @@ class SegmentationModel(str, Enum):
     OTSU = "otsu"                      # Simple thresholding
 
 
+# Recommended diameters by image modality
+# These are tuned for typical microscopy images
+DIAMETER_BY_MODALITY = {
+    'brightfield': 30.0,      # Standard cell culture
+    'fluorescence': 30.0,     # Fluorescent markers
+    'phase_contrast': 30.0,   # Phase contrast microscopy
+    'he_stain': 10.0,         # H&E histology - small nuclei!
+    'he_stained': 10.0,       # Alias
+    'histology': 10.0,        # Alias
+    'default': 30.0,          # Fallback
+}
+
+# Recommended diameters by model type
+DIAMETER_BY_MODEL = {
+    'nuclei': 17.0,           # Nuclei are smaller
+    'cyto3': 30.0,            # Cytoplasm
+    'cyto2': 30.0,            # Cytoplasm
+    'cpsam': 30.0,            # Cellpose-SAM
+}
+
+
 @dataclass
 class SegmentationResult:
     """Container for segmentation output."""
@@ -110,11 +131,14 @@ class CellSegmenter:
 
         logger.info(f"Loading Cellpose model '{model_name}' (GPU: {self.use_gpu})")
 
-        # Cellpose 4.x uses CellposeModel for all models
+        # Cellpose 4.x uses pretrained_model parameter (not model_type!)
+        # model_type is deprecated and ignored in v4.0.1+
         self._cellpose_model = models.CellposeModel(
-            model_type=model_name,
+            pretrained_model=model_name,
             gpu=self.use_gpu
         )
+
+        # Default diameter is set later based on context (see set_diameter_for_modality)
 
     def segment(
         self,

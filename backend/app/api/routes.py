@@ -28,8 +28,10 @@ from app.models.schemas import (
 )
 from app.core.config import settings, ensure_directories
 from app.core.preprocessing import ImagePreprocessor, ImageModality
+from app.core.calibration import MicroscopeCalibration, get_available_objectives
+from app.core.quality import ImageQualityChecker, quick_quality_check
 from app.services.segmentation import CellSegmenter, CELLPOSE_AVAILABLE, GPU_AVAILABLE
-from app.services.morphometry import MorphometryAnalyzer
+from app.services.morphometry import MorphometryAnalyzer, RBCFilter
 from app.services.report import ReportGenerator, ReportMetadata
 
 import logging
@@ -126,30 +128,38 @@ async def health_check():
 @router.post("/analyze", response_model=AnalysisResponse)
 async def analyze_image(
     file: UploadFile = File(...),
-    modality: str = "brightfield",
-    model: str = "cyto3",
+    modality: str = "auto",
+    model: str = "auto",
     diameter: float | None = None,
+    objective: str | None = None,
     pixel_size_um: float = 1.0,
     compute_texture: bool = True,
+    check_quality: bool = True,
+    exclude_rbc: bool = False,
     generate_report: bool = True,
     report_format: str = "pdf"
 ):
     """
-    Analyze a single microscopy image.
+    Analyze a single microscopy image with full calibration and quality control.
 
     This endpoint performs:
-    1. Image preprocessing based on modality
-    2. Cell segmentation using the specified model
-    3. Morphometric measurements
-    4. Optional report generation
+    1. Quality assessment (optional) - checks focus, tissue content, artifacts
+    2. Image preprocessing based on modality (auto-detected if not specified)
+    3. Cell segmentation using the specified model (auto-selected based on modality)
+    4. RBC exclusion (optional) - removes red blood cells from analysis
+    5. Morphometric measurements with proper calibration (µm, µm²)
+    6. Optional report generation
 
     Args:
         file: Uploaded image file (PNG, JPEG, TIFF)
-        modality: Image type (brightfield, fluorescence, phase_contrast, he_stained)
-        model: Segmentation model (cyto3, nuclei, cpsam, watershed, otsu)
+        modality: Image type (auto, brightfield, fluorescence, phase_contrast, he_stained)
+        model: Segmentation model (auto, cyto3, nuclei, cpsam, watershed, otsu)
         diameter: Expected cell diameter in pixels (None = auto-detect)
-        pixel_size_um: Pixel size in microns for calibration
-        compute_texture: Whether to compute texture features
+        objective: Microscope objective (4x, 10x, 20x, 40x, 60x, 100x) - overrides pixel_size_um
+        pixel_size_um: Pixel size in microns (used if objective not specified)
+        compute_texture: Whether to compute GLCM texture features
+        check_quality: Whether to perform quality assessment before analysis
+        exclude_rbc: Whether to exclude red blood cells (for H&E histology)
         generate_report: Whether to generate a report
         report_format: Report format (pdf, excel, json, all)
 
@@ -174,7 +184,33 @@ async def analyze_image(
         # Ensure directories exist
         ensure_directories()
 
-        # 1. Preprocessing
+        # =================================================================
+        # 0. QUALITY CHECK (optional)
+        # =================================================================
+        quality_report = None
+        if check_quality:
+            quality_checker = ImageQualityChecker(is_histology=(modality == "he_stained" or modality == "auto"))
+            quality_report = quality_checker.assess(image_array)
+            logger.info(f"Quality assessment: {quality_report.quality_level.value} "
+                       f"(score: {quality_report.overall_quality:.2f})")
+            if not quality_report.is_usable:
+                logger.warning(f"Image quality issues: {quality_report.issues}")
+
+        # =================================================================
+        # 1. CALIBRATION SETUP
+        # =================================================================
+        if objective:
+            calibration = MicroscopeCalibration.from_objective(objective)
+            actual_pixel_size = calibration.pixel_size_um
+            logger.info(f"Using objective preset: {objective} ({actual_pixel_size} µm/px)")
+        else:
+            calibration = MicroscopeCalibration(pixel_size_um=pixel_size_um)
+            actual_pixel_size = pixel_size_um
+            logger.info(f"Using custom pixel size: {actual_pixel_size} µm/px")
+
+        # =================================================================
+        # 2. PREPROCESSING (with auto-detection if modality="auto")
+        # =================================================================
         preprocessor = ImagePreprocessor()
         preprocess_result = preprocessor.process(
             image_array,
@@ -182,10 +218,45 @@ async def analyze_image(
         )
         processed_image = preprocess_result.image
 
-        # 2. Segmentation
+        # Get the actual modality used (may have been auto-detected)
+        actual_modality = preprocess_result.modality
+
+        # Log detection results
+        if preprocess_result.detected_modality:
+            logger.info(f"Auto-detected modality: {actual_modality.value} "
+                       f"(confidence: {preprocess_result.detection_confidence:.2f})")
+
+        # =================================================================
+        # 3. AUTO-SELECT SEGMENTATION MODEL
+        # =================================================================
+        actual_model = model
+        actual_diameter = diameter
+
+        if model == "auto":
+            model_by_modality = {
+                ImageModality.HE_STAINED: "nuclei",
+                ImageModality.FLUORESCENCE: "cyto3",
+                ImageModality.BRIGHTFIELD: "cyto3",
+                ImageModality.PHASE_CONTRAST: "cyto3",
+            }
+            actual_model = model_by_modality.get(actual_modality, "cyto3")
+            logger.info(f"Auto-selected model: {actual_model} for {actual_modality.value}")
+
+        # Auto-select diameter based on calibration and modality
+        if actual_diameter is None:
+            if actual_modality == ImageModality.HE_STAINED:
+                # Use calibration to get nucleus diameter in pixels
+                actual_diameter = calibration.get_nucleus_diameter_pixels()
+            else:
+                actual_diameter = calibration.get_expected_cell_diameter_pixels()
+            logger.info(f"Auto-selected diameter: {actual_diameter:.1f} px")
+
+        # =================================================================
+        # 4. SEGMENTATION
+        # =================================================================
         segmenter = CellSegmenter(
-            model=model,
-            diameter=diameter,
+            model=actual_model,
+            diameter=actual_diameter,
             use_gpu=True
         )
         seg_result = segmenter.segment(processed_image)
@@ -203,12 +274,32 @@ async def analyze_image(
                 measurements=[]
             )
 
-        # 3. Morphometry
+        # =================================================================
+        # 5. MORPHOMETRY with proper calibration
+        # =================================================================
         analyzer = MorphometryAnalyzer(
-            pixel_size_um=pixel_size_um,
+            pixel_size_um=actual_pixel_size,
+            objective=objective,
             compute_texture=compute_texture
         )
         morph_result = analyzer.analyze(seg_result.masks, image_array)
+
+        # =================================================================
+        # 6. RBC EXCLUSION (optional, for histology)
+        # =================================================================
+        rbc_stats = None
+        if exclude_rbc and actual_modality == ImageModality.HE_STAINED:
+            rbc_filter = RBCFilter(calibration=calibration)
+            non_rbc_cells, rbc_cells, rbc_stats = rbc_filter.filter_rbcs(
+                morph_result.measurements,
+                color_image=image_array,
+                mask=seg_result.masks
+            )
+            # Replace measurements with filtered list
+            morph_result.measurements = non_rbc_cells
+            logger.info(f"RBC exclusion: removed {rbc_stats['rbc_count']} RBCs "
+                       f"({rbc_stats['rbc_percentage']:.1f}%)")
+
         df = morph_result.to_dataframe()
 
         # 4. Prepare response
@@ -258,7 +349,7 @@ async def analyze_image(
             metadata = ReportMetadata(
                 title="Morphometry Analysis Report",
                 image_filename=file.filename or "uploaded_image",
-                segmentation_model=model,
+                segmentation_model=actual_model,
                 pixel_size_um=pixel_size_um,
                 preprocessing_steps=preprocess_result.applied_filters
             )
@@ -402,15 +493,21 @@ async def list_models():
     """List available segmentation models."""
     models = [
         {
+            "id": "auto",
+            "name": "Auto-Select",
+            "description": "Automatically select best model based on image type (nuclei for H&E, cyto3 for others)",
+            "recommended": True
+        },
+        {
             "id": "cyto3",
             "name": "Cellpose Cyto3",
             "description": "Latest cytoplasm model, best for most cell types",
-            "recommended": True
+            "recommended": False
         },
         {
             "id": "nuclei",
             "name": "Cellpose Nuclei",
-            "description": "Specialized for nuclei detection",
+            "description": "Specialized for nuclei detection (best for H&E histology)",
             "recommended": False
         },
         {
@@ -446,11 +543,32 @@ async def list_models():
     }
 
 
+@router.get("/objectives")
+async def list_objectives():
+    """List available microscope objective presets for calibration."""
+    return {
+        "objectives": get_available_objectives(),
+        "note": "Select objective for automatic pixel size calibration. "
+                "For custom calibration, use pixel_size_um parameter instead."
+    }
+
+
 @router.get("/modalities")
 async def list_modalities():
     """List supported image modalities."""
     return {
         "modalities": [
+            {
+                "id": "auto",
+                "name": "Auto-Detect",
+                "description": "Automatically detect image type (H&E, fluorescence, etc.)",
+                "recommended": True
+            },
+            {
+                "id": "he_stained",
+                "name": "H&E Stained",
+                "description": "Histology slides with Hematoxylin & Eosin staining"
+            },
             {
                 "id": "brightfield",
                 "name": "Brightfield",
@@ -465,11 +583,6 @@ async def list_modalities():
                 "id": "phase_contrast",
                 "name": "Phase Contrast",
                 "description": "Unstained cells with enhanced contrast"
-            },
-            {
-                "id": "he_stained",
-                "name": "H&E Stained",
-                "description": "Histology slides with Hematoxylin & Eosin staining"
             }
         ]
     }
