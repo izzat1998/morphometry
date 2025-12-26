@@ -251,28 +251,180 @@ class CellSegmenter:
         masks: np.ndarray,
         flows: list | None
     ) -> list[float]:
-        """Calculate per-cell confidence scores."""
-        if flows is None:
+        """
+        Calculate per-cell confidence scores using multiple factors.
+
+        Confidence is computed from:
+        1. Cell probability (cellprob) - Cellpose's confidence that pixels are cells
+        2. Flow consistency - How well flow vectors converge to cell center
+        3. Morphology - Shape regularity (circularity, solidity)
+
+        Each factor is weighted to produce a final 0-1 confidence score.
+
+        Args:
+            masks: Label image where each cell has a unique integer ID
+            flows: Cellpose output [flow_field, cellprob, style] or None
+
+        Returns:
+            List of confidence scores, one per cell (empty if flows unavailable)
+        """
+        if masks.max() == 0:
             return []
 
         # Ensure masks are integer type
         masks_int = masks.astype(np.int32)
 
-        # Get all region properties at once (more efficient)
+        # Get region properties for morphology calculations
         props_list = measure.regionprops(masks_int)
 
+        # Extract flow components if available
+        cellprob = None
+        flow_field = None
+
+        if flows is not None and len(flows) >= 2:
+            # flows[0] = flow field (2, H, W) - Y and X gradients
+            # flows[1] = cell probability map (H, W)
+            # flows[2] = style vectors (optional)
+            flow_field = flows[0] if len(flows[0].shape) == 3 else None
+            cellprob = flows[1] if len(flows) > 1 else None
+
         confidence_scores = []
+
         for props in props_list:
-            # Circularity as a proxy for confidence
-            area = props.area
-            perimeter = props.perimeter
-            if perimeter > 0:
-                circularity = 4 * np.pi * area / (perimeter ** 2)
-                confidence_scores.append(min(circularity, 1.0))
-            else:
-                confidence_scores.append(0.5)
+            label = props.label
+            cell_mask = (masks_int == label)
+
+            # === Factor 1: Cell Probability (weight: 0.4) ===
+            # Mean cellprob within the cell region
+            cellprob_score = 0.5  # Default if not available
+            if cellprob is not None:
+                try:
+                    cell_probs = cellprob[cell_mask]
+                    if len(cell_probs) > 0:
+                        # Cellprob is typically in range [-6, 6], sigmoid to [0, 1]
+                        mean_prob = np.mean(cell_probs)
+                        # Convert to 0-1 range using sigmoid
+                        cellprob_score = 1 / (1 + np.exp(-mean_prob))
+                except (IndexError, ValueError):
+                    pass
+
+            # === Factor 2: Flow Consistency (weight: 0.3) ===
+            # Measures how well flow vectors point toward cell center
+            flow_score = 0.5  # Default if not available
+            if flow_field is not None and flow_field.shape[0] >= 2:
+                try:
+                    flow_score = self._compute_flow_consistency(
+                        flow_field, cell_mask, props.centroid
+                    )
+                except (IndexError, ValueError):
+                    pass
+
+            # === Factor 3: Morphology Score (weight: 0.3) ===
+            # Combines circularity and solidity
+            morph_score = self._compute_morphology_score(props)
+
+            # === Weighted combination ===
+            # Weights emphasize cellprob (most reliable from Cellpose)
+            confidence = (
+                0.4 * cellprob_score +
+                0.3 * flow_score +
+                0.3 * morph_score
+            )
+
+            # Clamp to [0, 1]
+            confidence = float(np.clip(confidence, 0.0, 1.0))
+            confidence_scores.append(confidence)
 
         return confidence_scores
+
+    def _compute_flow_consistency(
+        self,
+        flow_field: np.ndarray,
+        cell_mask: np.ndarray,
+        centroid: tuple[float, float]
+    ) -> float:
+        """
+        Compute flow consistency score for a cell.
+
+        Measures how well the flow vectors within a cell point toward
+        the cell's centroid. High consistency = high confidence.
+
+        Args:
+            flow_field: (2, H, W) array of Y and X flow components
+            cell_mask: Boolean mask for this cell
+            centroid: (row, col) centroid of the cell
+
+        Returns:
+            Flow consistency score in [0, 1]
+        """
+        # Get coordinates of cell pixels
+        rows, cols = np.where(cell_mask)
+        if len(rows) < 4:  # Too few pixels to compute meaningful flow
+            return 0.5
+
+        # Get flow vectors at cell pixels
+        flow_y = flow_field[0][cell_mask]
+        flow_x = flow_field[1][cell_mask]
+
+        # Compute expected flow direction (toward centroid)
+        cy, cx = centroid
+        expected_y = cy - rows
+        expected_x = cx - cols
+
+        # Normalize expected vectors
+        expected_mag = np.sqrt(expected_y**2 + expected_x**2) + 1e-8
+        expected_y = expected_y / expected_mag
+        expected_x = expected_x / expected_mag
+
+        # Normalize actual flow vectors
+        flow_mag = np.sqrt(flow_y**2 + flow_x**2) + 1e-8
+        flow_y_norm = flow_y / flow_mag
+        flow_x_norm = flow_x / flow_mag
+
+        # Compute cosine similarity (dot product of unit vectors)
+        # Values range from -1 (opposite) to 1 (same direction)
+        cos_sim = flow_y_norm * expected_y + flow_x_norm * expected_x
+
+        # Average cosine similarity, shifted to [0, 1]
+        mean_cos_sim = np.mean(cos_sim)
+        flow_score = (mean_cos_sim + 1) / 2  # Map [-1, 1] to [0, 1]
+
+        return float(flow_score)
+
+    def _compute_morphology_score(self, props) -> float:
+        """
+        Compute morphology-based confidence score.
+
+        Combines circularity and solidity to assess shape regularity.
+        Real cells tend to have smooth, convex boundaries.
+
+        Args:
+            props: regionprops object for the cell
+
+        Returns:
+            Morphology score in [0, 1]
+        """
+        area = props.area
+        perimeter = props.perimeter
+
+        # Circularity: 1.0 for perfect circle, lower for irregular shapes
+        if perimeter > 0:
+            circularity = 4 * np.pi * area / (perimeter ** 2)
+            circularity = min(circularity, 1.0)  # Cap at 1.0
+        else:
+            circularity = 0.5
+
+        # Solidity: ratio of area to convex hull area
+        # High solidity = fewer concavities = more cell-like
+        try:
+            solidity = props.solidity
+        except (AttributeError, ZeroDivisionError):
+            solidity = 0.5
+
+        # Combine: weight solidity slightly higher (cells should be convex)
+        morph_score = 0.4 * circularity + 0.6 * solidity
+
+        return float(morph_score)
 
     # =========================================================================
     # CLASSICAL SEGMENTATION METHODS (Fallbacks)

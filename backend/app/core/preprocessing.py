@@ -1123,10 +1123,10 @@ class ImagePreprocessor:
 
         Pipeline:
         1. White balance correction (fixes color cast from camera/microscope)
-        2. Macenko stain normalization (standardizes H&E colors across slides)
-        3. Color deconvolution to separate H&E channels
-        4. Extract hematoxylin channel (highlights nuclei)
-        5. Contrast enhancement (CLAHE)
+        2. Macenko stain normalization + deconvolution (uses image-specific stain vectors)
+           OR fallback to standard Ruifrok deconvolution if normalization disabled/fails
+        3. Extract hematoxylin channel (highlights nuclei)
+        4. Contrast enhancement (CLAHE)
 
         Args:
             image: RGB input image
@@ -1144,48 +1144,61 @@ class ImagePreprocessor:
         # Fix color cast from camera/microscope (green tint, etc.)
         corrected = self.white_balance_histology(image)
 
-        # Step 2: MACENKO STAIN NORMALIZATION (new!)
-        # Standardize H&E colors to reference standard
-        # This ensures consistent segmentation across different slides
+        # Step 2 & 3: STAIN SEPARATION
+        # Use Macenko for both normalization AND deconvolution (consistent stain vectors)
+        hematoxylin = None
+
         if use_stain_normalization:
             try:
                 normalizer = MacenkoNormalizer()
-                normalized = normalizer.normalize(corrected)
-                self.applied_filters.append("macenko_normalization")
+                # Use get_stain_channels() which extracts image-specific stain vectors
+                # and uses them consistently for deconvolution
+                h_channel, _ = normalizer.get_stain_channels(corrected)
+                self.applied_filters.append("macenko_deconvolution")
+
+                # Convert H channel to grayscale (it's RGB with only H stain)
+                # Invert because get_stain_channels returns RGB where white=no stain
+                h_gray = cv2.cvtColor(h_channel, cv2.COLOR_RGB2GRAY)
+                # Invert: nuclei should be bright, background dark
+                hematoxylin = 255 - h_gray
+
             except Exception as e:
-                # If normalization fails, continue with just white-balanced image
-                normalized = corrected
-                self.applied_filters.append(f"macenko_skipped:{str(e)[:30]}")
-        else:
-            normalized = corrected
+                # If Macenko fails, fall back to standard deconvolution
+                self.applied_filters.append(f"macenko_failed:{str(e)[:30]}")
+                hematoxylin = None
 
-        # Step 3: Color deconvolution for H&E
-        # Standard H&E stain vectors (Ruifrok and Johnston)
-        stain_matrix = np.array([
-            [0.65, 0.70, 0.29],   # Hematoxylin (blue-purple)
-            [0.07, 0.99, 0.11],   # Eosin (pink)
-            [0.27, 0.57, 0.78]    # Residual/DAB
-        ])
+        # Fallback: Standard Ruifrok deconvolution if Macenko not used or failed
+        if hematoxylin is None:
+            self.applied_filters.append("ruifrok_deconvolution")
 
-        # Convert to optical density (OD = -log10(I/I0))
-        image_od = -np.log10((normalized.astype(np.float32) + 1) / 256)
+            # Standard H&E stain vectors (Ruifrok and Johnston, 2001)
+            # These are normalized OD vectors for H, E, and residual
+            stain_matrix = np.array([
+                [0.65, 0.70, 0.29],   # Hematoxylin (blue-purple)
+                [0.07, 0.99, 0.11],   # Eosin (pink)
+                [0.27, 0.57, 0.78]    # Residual/DAB
+            ])
 
-        # Deconvolve using pseudo-inverse
-        stain_matrix_inv = np.linalg.pinv(stain_matrix)
-        deconvolved = np.dot(image_od.reshape(-1, 3), stain_matrix_inv.T)
-        deconvolved = deconvolved.reshape(normalized.shape)
+            # Convert to optical density (OD = -log10(I/I0))
+            image_od = -np.log10((corrected.astype(np.float32) + 1) / 256)
 
-        # Step 4: Extract hematoxylin channel (nuclei have high OD values)
-        hematoxylin = deconvolved[:, :, 0]
+            # Deconvolve using pseudo-inverse
+            stain_matrix_inv = np.linalg.pinv(stain_matrix)
+            deconvolved = np.dot(image_od.reshape(-1, 3), stain_matrix_inv.T)
+            deconvolved = deconvolved.reshape(corrected.shape)
 
-        # Clip negative values
-        hematoxylin = np.clip(hematoxylin, 0, None)
+            # Extract hematoxylin channel (nuclei have high OD values)
+            hematoxylin = deconvolved[:, :, 0]
 
-        # Rescale to use full dynamic range (0-255)
-        # High OD = high stain = nuclei = bright in output
-        hematoxylin = exposure.rescale_intensity(hematoxylin, out_range=(0, 255))
+            # Clip negative values
+            hematoxylin = np.clip(hematoxylin, 0, None)
 
-        # Step 5: Enhance contrast with CLAHE
+            # Rescale to use full dynamic range (0-255)
+            # High OD = high stain = nuclei = bright in output
+            hematoxylin = exposure.rescale_intensity(hematoxylin, out_range=(0, 255))
+            hematoxylin = hematoxylin.astype(np.uint8)
+
+        # Step 4: Enhance contrast with CLAHE
         enhanced = self.enhance_clahe(hematoxylin.astype(np.uint8), clip_limit=3.0)
 
         return enhanced

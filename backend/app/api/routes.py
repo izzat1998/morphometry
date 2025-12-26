@@ -24,7 +24,8 @@ from app.models.schemas import (
     AnalysisRequest, AnalysisResponse, AnalysisSummary,
     CellMeasurementResponse, SummaryStatistics,
     PreprocessingOptions, SegmentationOptions,
-    HealthResponse, ErrorResponse, BatchAnalysisResponse
+    HealthResponse, ErrorResponse, BatchAnalysisResponse,
+    CalibrationInfo, CalibrationWarning
 )
 from app.core.config import settings, ensure_directories
 from app.core.preprocessing import ImagePreprocessor, ImageModality
@@ -204,9 +205,16 @@ async def analyze_image(
             actual_pixel_size = calibration.pixel_size_um
             logger.info(f"Using objective preset: {objective} ({actual_pixel_size} µm/px)")
         else:
-            calibration = MicroscopeCalibration(pixel_size_um=pixel_size_um)
+            calibration = MicroscopeCalibration.from_pixel_size(pixel_size_um)
             actual_pixel_size = pixel_size_um
             logger.info(f"Using custom pixel size: {actual_pixel_size} µm/px")
+
+        # Log calibration warnings
+        for warning in calibration.get_warnings():
+            if warning.level == "warning":
+                logger.warning(f"[{warning.code}] {warning.message}")
+            elif warning.level == "critical":
+                logger.error(f"[{warning.code}] {warning.message}")
 
         # =================================================================
         # 2. PREPROCESSING (with auto-detection if modality="auto")
@@ -398,12 +406,35 @@ async def analyze_image(
         with open(overlay_path, 'wb') as f:
             f.write(overlay_buffer.getvalue())
 
+        # Build calibration info with warnings
+        calib_summary = calibration.get_warning_summary()
+        calibration_info = CalibrationInfo(
+            status=calib_summary["status"],
+            source=calib_summary["source"],
+            is_calibrated=calib_summary["is_calibrated"],
+            pixel_size_um=calib_summary["pixel_size_um"],
+            objective=calibration.objective if calibration.objective != "custom" else None,
+            uncertainty_linear_percent=calib_summary["uncertainty_linear_percent"],
+            uncertainty_area_percent=calib_summary["uncertainty_area_percent"],
+            warnings=[
+                CalibrationWarning(
+                    level=w["level"],
+                    code=w["code"],
+                    message=w["message"],
+                    details=w["details"],
+                    recommendation=w["recommendation"]
+                )
+                for w in calib_summary["warnings"]
+            ]
+        )
+
         return AnalysisResponse(
             success=True,
             message=f"Successfully analyzed {morph_result.total_cells} cells",
             analysis_id=analysis_id,
             summary=summary,
             measurements=measurements,
+            calibration=calibration_info,
             report_urls=report_urls if report_urls else None,
             mask_url=f"/download/{analysis_id}_mask.png",
             overlay_url=f"/download/{analysis_id}_overlay.png"

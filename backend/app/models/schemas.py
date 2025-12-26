@@ -76,6 +76,27 @@ class AnalysisSummary(BaseModel):
     processing_time_seconds: float
 
 
+class CalibrationWarning(BaseModel):
+    """Warning about calibration uncertainty."""
+    level: Literal["info", "warning", "critical"]
+    code: str
+    message: str
+    details: str
+    recommendation: str
+
+
+class CalibrationInfo(BaseModel):
+    """Calibration information and uncertainty warnings."""
+    status: Literal["ok", "warning", "critical"]
+    source: str  # "preset", "stage_micrometer", "user_provided", etc.
+    is_calibrated: bool
+    pixel_size_um: float
+    objective: str | None = None
+    uncertainty_linear_percent: float
+    uncertainty_area_percent: float
+    warnings: list[CalibrationWarning] = []
+
+
 class AnalysisResponse(BaseModel):
     """Complete analysis response."""
     success: bool
@@ -83,6 +104,7 @@ class AnalysisResponse(BaseModel):
     analysis_id: str
     summary: AnalysisSummary
     measurements: list[CellMeasurementResponse]
+    calibration: CalibrationInfo | None = None  # Calibration info with warnings
     report_urls: dict[str, str] | None = None  # URLs to download reports
     mask_url: str | None = None  # URL to download segmentation mask
     overlay_url: str | None = None  # URL to download overlay image
